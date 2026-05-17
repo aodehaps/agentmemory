@@ -1,11 +1,16 @@
 import type { MemoryProvider } from "../types.js";
 import { getEnvVar } from "../config.js";
 import { fetchWithTimeout } from "./_fetch.js";
+import {
+  DEFAULT_AZURE_API_VERSION,
+  buildAuthHeaders,
+  buildChatUrl,
+  detectAzure,
+  normalizeBaseUrl,
+} from "./_openai-shared.js";
 
-const DEFAULT_BASE_URL = "https://api.openai.com";
 const DEFAULT_MODEL = "gpt-4o-mini";
 const DEFAULT_TIMEOUT_MS = 60_000;
-const DEFAULT_AZURE_API_VERSION = "2024-08-01-preview";
 
 /**
  * OpenAI-compatible LLM provider.
@@ -54,11 +59,7 @@ export class OpenAIProvider implements MemoryProvider {
     this.apiKey = apiKey;
     this.model = model;
     this.maxTokens = maxTokens;
-    this.baseUrl = (
-      baseURL ||
-      getEnvVar("OPENAI_BASE_URL") ||
-      DEFAULT_BASE_URL
-    ).replace(/\/+$/, "");
+    this.baseUrl = normalizeBaseUrl(baseURL || getEnvVar("OPENAI_BASE_URL"));
     this.reasoningEffort = getEnvVar("OPENAI_REASONING_EFFORT") || undefined;
     this.timeoutMs = resolveTimeout();
     this.azureApiVersion =
@@ -74,33 +75,8 @@ export class OpenAIProvider implements MemoryProvider {
     return this.call(systemPrompt, userPrompt);
   }
 
-  private buildUrl(): string {
-    // Azure OpenAI carries the deployment in the path and requires
-    // `api-version` as a query param. Standard OpenAI-compatible
-    // endpoints append /v1/chat/completions to the base.
-    if (this.isAzure) {
-      const sep = this.baseUrl.includes("?") ? "&" : "?";
-      return `${this.baseUrl}/chat/completions${sep}api-version=${encodeURIComponent(this.azureApiVersion)}`;
-    }
-    return `${this.baseUrl}/v1/chat/completions`;
-  }
-
-  private buildHeaders(): Record<string, string> {
-    // Azure uses `api-key: <KEY>`; everyone else uses `Authorization: Bearer <KEY>`.
-    if (this.isAzure) {
-      return {
-        "Content-Type": "application/json",
-        "api-key": this.apiKey,
-      };
-    }
-    return {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${this.apiKey}`,
-    };
-  }
-
   private async call(systemPrompt: string, userPrompt: string): Promise<string> {
-    const url = this.buildUrl();
+    const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
     const body: Record<string, unknown> = {
       model: this.model,
       max_tokens: this.maxTokens,
@@ -125,7 +101,7 @@ export class OpenAIProvider implements MemoryProvider {
         url,
         {
           method: "POST",
-          headers: this.buildHeaders(),
+          headers: buildAuthHeaders(this.apiKey, this.isAzure),
           body: JSON.stringify(body),
         },
         this.timeoutMs,
@@ -193,14 +169,3 @@ function parsePositiveInt(raw: string | null | undefined): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
-function detectAzure(baseUrl: string): boolean {
-  // Azure resource URLs land at <resource>.openai.azure.com. The
-  // `OPENAI_BASE_URL=https://<r>.openai.azure.com/openai/deployments/<d>`
-  // shape is the documented opt-in path.
-  try {
-    const u = new URL(baseUrl);
-    return u.hostname.endsWith(".openai.azure.com");
-  } catch {
-    return false;
-  }
-}

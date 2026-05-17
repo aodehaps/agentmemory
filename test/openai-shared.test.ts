@@ -1,0 +1,192 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  buildAuthHeaders,
+  buildChatUrl,
+  buildEmbeddingUrl,
+  detectAzure,
+  normalizeBaseUrl,
+} from "../src/providers/_openai-shared.js";
+import { OpenAIEmbeddingProvider } from "../src/providers/embedding/openai.js";
+
+describe("_openai-shared — detectAzure", () => {
+  it("detects standard Azure resource hostname", () => {
+    expect(
+      detectAzure(
+        "https://myresource.openai.azure.com/openai/deployments/mydeploy",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not flag api.openai.com", () => {
+    expect(detectAzure("https://api.openai.com")).toBe(false);
+  });
+
+  it("does not flag DeepSeek / SiliconFlow / Ollama / vLLM", () => {
+    expect(detectAzure("https://api.deepseek.com/v1")).toBe(false);
+    expect(detectAzure("https://api.siliconflow.cn")).toBe(false);
+    expect(detectAzure("http://localhost:11434/v1")).toBe(false);
+    expect(detectAzure("http://localhost:8000/v1")).toBe(false);
+  });
+
+  it("returns false for malformed URLs", () => {
+    expect(detectAzure("not-a-url")).toBe(false);
+    expect(detectAzure("")).toBe(false);
+  });
+});
+
+describe("_openai-shared — buildChatUrl", () => {
+  it("appends /v1/chat/completions for standard OpenAI", () => {
+    expect(buildChatUrl("https://api.openai.com", false, "2024-08-01-preview")).toBe(
+      "https://api.openai.com/v1/chat/completions",
+    );
+  });
+
+  it("appends /chat/completions + api-version for Azure", () => {
+    const url = buildChatUrl(
+      "https://myresource.openai.azure.com/openai/deployments/mydeploy",
+      true,
+      "2024-08-01-preview",
+    );
+    expect(url).toBe(
+      "https://myresource.openai.azure.com/openai/deployments/mydeploy/chat/completions?api-version=2024-08-01-preview",
+    );
+  });
+
+  it("URL-encodes the api-version", () => {
+    const url = buildChatUrl(
+      "https://r.openai.azure.com/openai/deployments/d",
+      true,
+      "preview/with/slashes",
+    );
+    expect(url).toContain("api-version=preview%2Fwith%2Fslashes");
+  });
+});
+
+describe("_openai-shared — buildEmbeddingUrl", () => {
+  it("appends /v1/embeddings for standard OpenAI", () => {
+    expect(
+      buildEmbeddingUrl("https://api.openai.com", false, "2024-08-01-preview"),
+    ).toBe("https://api.openai.com/v1/embeddings");
+  });
+
+  it("appends /embeddings + api-version for Azure (no /v1/ prefix)", () => {
+    const url = buildEmbeddingUrl(
+      "https://r.openai.azure.com/openai/deployments/embed-deploy",
+      true,
+      "2024-08-01-preview",
+    );
+    expect(url).toBe(
+      "https://r.openai.azure.com/openai/deployments/embed-deploy/embeddings?api-version=2024-08-01-preview",
+    );
+  });
+});
+
+describe("_openai-shared — buildAuthHeaders", () => {
+  it("emits Authorization: Bearer for standard OpenAI", () => {
+    expect(buildAuthHeaders("sk-test", false)).toEqual({
+      "Content-Type": "application/json",
+      Authorization: "Bearer sk-test",
+    });
+  });
+
+  it("emits api-key header for Azure", () => {
+    expect(buildAuthHeaders("azure-key", true)).toEqual({
+      "Content-Type": "application/json",
+      "api-key": "azure-key",
+    });
+  });
+});
+
+describe("_openai-shared — normalizeBaseUrl", () => {
+  it("returns default when no value passed", () => {
+    expect(normalizeBaseUrl(undefined)).toBe("https://api.openai.com");
+    expect(normalizeBaseUrl("")).toBe("https://api.openai.com");
+  });
+
+  it("strips trailing slashes", () => {
+    expect(normalizeBaseUrl("https://api.deepseek.com/v1///")).toBe(
+      "https://api.deepseek.com/v1",
+    );
+  });
+
+  it("returns explicit values unchanged otherwise", () => {
+    expect(normalizeBaseUrl("https://api.deepseek.com/v1")).toBe(
+      "https://api.deepseek.com/v1",
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// OpenAIEmbeddingProvider — Azure transport (#371)
+// Verifies the embedding path now uses the shared Azure helpers:
+// hits /embeddings (not /v1/embeddings), includes api-version, uses
+// api-key header instead of Authorization: Bearer.
+// ─────────────────────────────────────────────────────────────
+describe("OpenAIEmbeddingProvider — Azure auto-detection (#371)", () => {
+  const ORIGINAL_BASE = process.env["OPENAI_BASE_URL"];
+  const ORIGINAL_VERSION = process.env["OPENAI_API_VERSION"];
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    if (ORIGINAL_BASE === undefined) delete process.env["OPENAI_BASE_URL"];
+    else process.env["OPENAI_BASE_URL"] = ORIGINAL_BASE;
+    if (ORIGINAL_VERSION === undefined) delete process.env["OPENAI_API_VERSION"];
+    else process.env["OPENAI_API_VERSION"] = ORIGINAL_VERSION;
+    vi.restoreAllMocks();
+  });
+
+  it("uses Azure shape when OPENAI_BASE_URL points at *.openai.azure.com", async () => {
+    process.env["OPENAI_BASE_URL"] =
+      "https://myres.openai.azure.com/openai/deployments/embed-d";
+    process.env["OPENAI_API_VERSION"] = "2024-08-01-preview";
+
+    let capturedUrl = "";
+    let capturedHeaders: Record<string, string> = {};
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        capturedUrl = String(url);
+        capturedHeaders = (init?.headers ?? {}) as Record<string, string>;
+        return new Response(
+          JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }),
+          { status: 200 },
+        );
+      },
+    );
+
+    const provider = new OpenAIEmbeddingProvider("azure-key");
+    await provider.embedBatch(["hello"]);
+
+    expect(capturedUrl).toBe(
+      "https://myres.openai.azure.com/openai/deployments/embed-d/embeddings?api-version=2024-08-01-preview",
+    );
+    expect(capturedHeaders["api-key"]).toBe("azure-key");
+    expect(capturedHeaders["Authorization"]).toBeUndefined();
+  });
+
+  it("uses standard shape when OPENAI_BASE_URL points at api.openai.com", async () => {
+    process.env["OPENAI_BASE_URL"] = "https://api.openai.com";
+
+    let capturedUrl = "";
+    let capturedHeaders: Record<string, string> = {};
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        capturedUrl = String(url);
+        capturedHeaders = (init?.headers ?? {}) as Record<string, string>;
+        return new Response(
+          JSON.stringify({ data: [{ embedding: [0.4, 0.5, 0.6] }] }),
+          { status: 200 },
+        );
+      },
+    );
+
+    const provider = new OpenAIEmbeddingProvider("sk-test");
+    await provider.embedBatch(["hello"]);
+
+    expect(capturedUrl).toBe("https://api.openai.com/v1/embeddings");
+    expect(capturedHeaders["Authorization"]).toBe("Bearer sk-test");
+    expect(capturedHeaders["api-key"]).toBeUndefined();
+  });
+});
